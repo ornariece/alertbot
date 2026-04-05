@@ -1,4 +1,5 @@
 import json
+from urllib.parse import quote
 
 import dateutil.parser
 from aiohttp.web import Request, Response, json_response
@@ -58,10 +59,15 @@ def convert_slack_webhook_to_markdown(data):
 
 
 def get_alert_type(data):
-    """
-    Currently supported are ["grafana-alert", "grafana-resolved", "prometheus-alert", "not-found"]
+    """Detect the type of incoming webhook payload.
 
-    :return: alert type
+    Supported types:
+      - slack-webhook: Slack-format payload with text + attachments
+      - uptime-kuma-alert / uptime-kuma-resolved: Uptime Kuma heartbeat
+      - grafana-alert / grafana-resolved: Grafana alert with grafana_folder label
+      - alertmanager-alert / alertmanager-resolved: Any Alertmanager webhook
+        (includes Prometheus-originated alerts — the "job" label is NOT required)
+      - not-found: Unrecognized format
     """
 
     if ("text" in data) and ("attachments" in data):
@@ -86,17 +92,152 @@ def get_alert_type(data):
     except (KeyError, IndexError, TypeError):
         pass
 
-    # Prometheus
+    # Generic Alertmanager webhook: has alerts[] with labels.alertname.
+    # This covers Prometheus-originated alerts, custom alerts, and any other
+    # source that sends through Alertmanager. No "job" label required.
     try:
-        if data["alerts"][0]["labels"]["job"]:
+        if data["alerts"][0]["labels"]["alertname"]:
             if data['status'] == "firing":
-                return "prometheus-alert"
+                return "alertmanager-alert"
             else:
-                return "prometheus-resolved"
+                return "alertmanager-resolved"
     except (KeyError, IndexError, TypeError):
         pass
 
     return "not-found"
+
+
+def _format_duration(start_str, end_str):
+    """Calculate human-readable duration between two ISO 8601 timestamps."""
+    try:
+        start = dateutil.parser.isoparse(start_str)
+        end = dateutil.parser.isoparse(end_str)
+        delta = end - start
+        total_seconds = int(delta.total_seconds())
+        if total_seconds < 0:
+            return None
+
+        days, remainder = divmod(total_seconds, 86400)
+        hours, remainder = divmod(remainder, 3600)
+        minutes, _ = divmod(remainder, 60)
+
+        parts = []
+        if days:
+            parts.append(f"{days}d")
+        if hours:
+            parts.append(f"{hours}h")
+        if minutes or not parts:
+            parts.append(f"{minutes}m")
+        return " ".join(parts)
+    except (ValueError, TypeError):
+        return None
+
+
+def _format_timestamp(iso_str):
+    """Format an ISO 8601 timestamp as 'YYYY-MM-DD HH:MM UTC'."""
+    try:
+        dt = dateutil.parser.isoparse(iso_str)
+        return dt.strftime("%Y-%m-%d %H:%M UTC")
+    except (ValueError, TypeError):
+        return iso_str
+
+
+def _build_silence_url(external_url, alertname):
+    """Build a pre-filled Alertmanager silence URL for a given alertname."""
+    if not external_url:
+        return None
+    base = external_url.rstrip("/")
+    filter_param = quote('{alertname="' + alertname + '"}')
+    return f"{base}/#/silences/new?filter={filter_param}"
+
+
+# Labels already shown in the title line — no need to repeat in metadata
+_SKIP_LABELS = {"alertname", "severity"}
+
+
+def alertmanager_to_markdown(alert_data: dict) -> list:
+    """Convert an Alertmanager webhook payload to formatted markdown messages.
+
+    Produces one message per alert in the payload. Each message follows
+    a structured format optimized for mobile notification clients:
+
+      1. Status emoji + alert name + severity  (= push notification text)
+      2. Description
+      3. Label metadata (one per line)
+      4. Timestamps
+      5. Source + silence links
+
+    Args:
+        alert_data: The full Alertmanager webhook payload dict.
+
+    Returns:
+        List of markdown-formatted message strings.
+    """
+    messages = []
+    external_url = alert_data.get("externalURL", "")
+
+    for alert in alert_data.get("alerts", []):
+        status = alert.get("status", "unknown")
+        labels = alert.get("labels", {})
+        annotations = alert.get("annotations", {})
+
+        alertname = labels.get("alertname", "Unknown")
+        severity = labels.get("severity", "")
+
+        # --- Title line ---
+        emoji = "\u2705" if status == "resolved" else "\U0001f525"
+        severity_text = f" \u00b7 {severity}" if severity and status != "resolved" else ""
+        status_text = " \u00b7 resolved" if status == "resolved" else ""
+        title = f"{emoji} **{alertname}**{severity_text}{status_text}"
+
+        # --- Description ---
+        description = annotations.get("description") or annotations.get("summary", "")
+
+        # --- Label metadata (as list items for proper line breaks) ---
+        meta_lines = []
+        for key, value in labels.items():
+            if key not in _SKIP_LABELS:
+                display_key = key.replace("_", " ").title()
+                meta_lines.append(f"- **{display_key}:** {value}")
+
+        # --- Timestamps ---
+        starts_at = alert.get("startsAt", "")
+        ends_at = alert.get("endsAt", "")
+
+        if status == "resolved":
+            time_parts = []
+            duration = _format_duration(starts_at, ends_at)
+            if duration:
+                time_parts.append(f"**Duration:** {duration}")
+            time_parts.append(f"**Resolved:** {_format_timestamp(ends_at)}")
+            meta_lines.append("- " + " \u00b7 ".join(time_parts))
+        elif starts_at:
+            meta_lines.append(f"- **Since:** {_format_timestamp(starts_at)}")
+
+        # --- Links ---
+        links = []
+        generator_url = alert.get("generatorURL", "")
+        if generator_url:
+            links.append(f"[Source]({generator_url})")
+        silence_url = _build_silence_url(external_url, alertname)
+        if silence_url and status != "resolved":
+            links.append(f"[Silence]({silence_url})")
+        link_line = " \u00b7 ".join(links)
+
+        # --- Assemble message ---
+        parts = [title, ""]
+        if description:
+            parts.append(description)
+            parts.append("")
+        for ml in meta_lines:
+            parts.append(ml)
+        if link_line:
+            parts.append("")
+            parts.append(link_line)
+
+        messages.append("\n".join(parts).strip())
+
+    return messages
 
 
 def get_alert_messages(alert_data: dict, raw_mode=False) -> list:
@@ -118,14 +259,10 @@ def get_alert_messages(alert_data: dict, raw_mode=False) -> list:
         try:
             if alert_type == "slack-webhook":
                 messages = convert_slack_webhook_to_markdown(alert_data)
-            elif alert_type == "grafana-alert":
+            elif alert_type in ("grafana-alert", "grafana-resolved"):
                 messages = grafana_alert_to_markdown(alert_data)
-            elif alert_type == "grafana-resolved":
-                messages = grafana_alert_to_markdown(alert_data)
-            elif alert_type == "prometheus-alert":
-                messages = prometheus_alert_to_markdown(alert_data)
-            elif alert_type == "prometheus-resolved":
-                messages = prometheus_alert_to_markdown(alert_data)
+            elif alert_type in ("alertmanager-alert", "alertmanager-resolved"):
+                messages = alertmanager_to_markdown(alert_data)
             elif alert_type == "uptime-kuma-alert":
                 messages = uptime_kuma_alert_to_markdown(alert_data)
             elif alert_type == "uptime-kuma-resolved":
@@ -213,35 +350,13 @@ def grafana_alert_to_markdown(alert_data: dict) -> list:
     return messages
 
 
-def prometheus_alert_to_markdown(alert_data: dict) -> str:
-    """
-    Converts a prometheus alert json to markdown
-
-    :param alert_data:
-    :return: Alert as fomatted markdown
-    """
-    messages = []
-    known_labels = ['alertname', 'instance', 'job']
-    for alert in alert_data["alerts"]:
-        title = alert['annotations']['description'] if 'description' in alert['annotations'] else \
-            alert['annotations']['summary']
-        message = f"""**{alert['status']}** {'💚' if alert['status'] == 'resolved' else '🔥'}: {title}"""
-        for label_name in known_labels:
-            try:
-                message += "\n* **{0}**: {1}".format(label_name.capitalize(), alert["labels"][label_name])
-            except:
-                pass
-        messages.append(message)
-    return messages
-
-
 class AlertBot(Plugin):
     raw_mode = False
 
-    async def send_alert(self, text, room):
+    async def send_alert(self, req, room):
+        text = await req.text()
         self.log.info(text)
         content = json.loads(text)
-
         for message in get_alert_messages(content, self.raw_mode):
             self.log.debug(f"Sending alert to {room}")
             await self.client.send_markdown(room, message)
@@ -249,15 +364,14 @@ class AlertBot(Plugin):
     @web.post("/webhook/{room_id}")
     async def webhook_room(self, req: Request) -> Response:
         room_id = req.match_info["room_id"].strip()
-        text = await req.text()
         try:
-            await self.send_alert(text, room=room_id)
+            await self.send_alert(req, room=room_id)
         except MForbidden:
             self.log.error(f"Could not send to {room_id}: Forbidden. Most likely the bot is not invited in the room.")
             return json_response('{"status": "forbidden", "error": "forbidden"}', status=403)
-        except json.decoder.JSONDecodeError:
-            self.log.error(f"Decoding the data failed. {text}")
-            return json_response({"status": "failed", "error": "JSON decoding failed", "data": text}, status=400)
+        except json.JSONDecodeError:
+            self.log.error(f"Decoding the data failed for {room_id}")
+            return json_response({"status": "failed", "error": "JSON decoding failed"}, status=400)
         return json_response({"status": "ok"})
 
     @command.new()
