@@ -73,7 +73,7 @@ def get_alert_type(data):
             return "uptime-kuma-alert"
         elif data["heartbeat"]["status"] == 1:
             return "uptime-kuma-resolved"
-    except KeyError:
+    except (KeyError, TypeError):
         pass
 
     # Grafana
@@ -83,7 +83,7 @@ def get_alert_type(data):
                 return "grafana-alert"
             else:
                 return "grafana-resolved"
-    except KeyError:
+    except (KeyError, IndexError, TypeError):
         pass
 
     # Prometheus
@@ -93,7 +93,7 @@ def get_alert_type(data):
                 return "prometheus-alert"
             else:
                 return "prometheus-resolved"
-    except KeyError:
+    except (KeyError, IndexError, TypeError):
         pass
 
     return "not-found"
@@ -118,7 +118,7 @@ def get_alert_messages(alert_data: dict, raw_mode=False) -> list:
         try:
             if alert_type == "slack-webhook":
                 messages = convert_slack_webhook_to_markdown(alert_data)
-            if alert_type == "grafana-alert":
+            elif alert_type == "grafana-alert":
                 messages = grafana_alert_to_markdown(alert_data)
             elif alert_type == "grafana-resolved":
                 messages = grafana_alert_to_markdown(alert_data)
@@ -132,7 +132,7 @@ def get_alert_messages(alert_data: dict, raw_mode=False) -> list:
                 messages = uptime_kuma_resolved_to_markdown(alert_data)
         except KeyError as e:
             messages = ["**Data received**\n```\n" + str(alert_data).strip(
-                "\n").strip() + f"\n```\nThe data was detected as {alert_type} but was not in an expected format. If you want to help the development of this bot, file a bug report [here](https://github.com/moan0s/alertbot/issues)\n{e.with_traceback()}"]
+                "\n").strip() + f"\n```\nThe data was detected as {alert_type} but was not in an expected format. If you want to help the development of this bot, file a bug report [here](https://github.com/moan0s/alertbot/issues)\n{e}"]
     return messages
 
 
