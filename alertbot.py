@@ -193,12 +193,15 @@ def alertmanager_to_markdown(alert_data: dict) -> list:
         # --- Description ---
         description = annotations.get("description") or annotations.get("summary", "")
 
-        # --- Label metadata (as list items for proper line breaks) ---
+        # --- Label metadata ---
+        # Use • character (not - markdown list marker) so CommonMark
+        # emits <p> + <br> instead of <ul><li>.  List markup renders
+        # with inconsistent indentation on Element X iOS.
         meta_lines = []
         for key, value in labels.items():
             if key not in _SKIP_LABELS:
                 display_key = key.replace("_", " ").title()
-                meta_lines.append(f"- **{display_key}:** {value}")
+                meta_lines.append(f"• **{display_key}:** {value}")
 
         # --- Timestamps ---
         starts_at = alert.get("startsAt", "")
@@ -210,9 +213,9 @@ def alertmanager_to_markdown(alert_data: dict) -> list:
             if duration:
                 time_parts.append(f"**Duration:** {duration}")
             time_parts.append(f"**Resolved:** {_format_timestamp(ends_at)}")
-            meta_lines.append("- " + " \u00b7 ".join(time_parts))
+            meta_lines.append("• " + " \u00b7 ".join(time_parts))
         elif starts_at:
-            meta_lines.append(f"- **Since:** {_format_timestamp(starts_at)}")
+            meta_lines.append(f"• **Since:** {_format_timestamp(starts_at)}")
 
         # --- Links ---
         links = []
@@ -228,9 +231,9 @@ def alertmanager_to_markdown(alert_data: dict) -> list:
         parts = [title, ""]
         if description:
             parts.append(description)
+        if meta_lines:
             parts.append("")
-        for ml in meta_lines:
-            parts.append(ml)
+            parts.append("  \n".join(meta_lines))
         if link_line:
             parts.append("")
             parts.append(link_line)
