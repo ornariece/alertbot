@@ -223,7 +223,7 @@ def prometheus_alert_to_markdown(alert_data: dict) -> str:
     messages = []
     known_labels = ['alertname', 'instance', 'job']
     for alert in alert_data["alerts"]:
-        title = alert['annotations']['description'] if hasattr(alert['annotations'], 'description') else \
+        title = alert['annotations']['description'] if 'description' in alert['annotations'] else \
             alert['annotations']['summary']
         message = f"""**{alert['status']}** {'💚' if alert['status'] == 'resolved' else '🔥'}: {title}"""
         for label_name in known_labels:
